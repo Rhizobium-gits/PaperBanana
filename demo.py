@@ -167,6 +167,7 @@ async def process_parallel_candidates(data_list, exp_mode="dev_planner_critic", 
 async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9", image_size="2K"):
     """
     Refine an image using an Image Editing API.
+    Supports OpenRouter (priority), Google API key, and Vertex AI ADC as fallback.
     
     Args:
         image_bytes: Image data in bytes
@@ -177,27 +178,70 @@ async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9
     Returns:
         Tuple of (edited_image_bytes, success_message)
     """
+    image_model = get_config_val("defaults", "image_gen_model_name", "IMAGE_GEN_MODEL_NAME", "")
+
+    # Encode image as base64 data URL for OpenRouter
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    image_data_url = f"data:image/jpeg;base64,{image_b64}"
+
+    # --- Path 1: OpenRouter (preferred, matches main pipeline priority) ---
+    try:
+        from utils.generation_utils import call_openrouter_image_generation_with_retry_async
+        _has_openrouter = True
+    except ImportError:
+        _has_openrouter = False
+    openrouter_api_key = get_config_val("api_keys", "openrouter_api_key", "OPENROUTER_API_KEY", "")
+    if _has_openrouter and openrouter_api_key:
+        try:
+            contents = [
+                {"type": "image", "data": image_b64, "mime_type": "image/jpeg"},
+                {"type": "text", "text": edit_prompt},
+            ]
+            config = {
+                "system_prompt": "",
+                "temperature": 1.0,
+                "aspect_ratio": aspect_ratio,
+                "image_size": image_size,
+            }
+            result = await call_openrouter_image_generation_with_retry_async(
+                model_name=image_model,
+                contents=contents,
+                config=config,
+                max_attempts=3,
+                retry_delay=10,
+                error_context="refine_image",
+            )
+            if result and result[0] != "Error":
+                return base64.b64decode(result[0]), "✅ Image refined successfully! (via OpenRouter)"
+        except Exception as e:
+            print(f"OpenRouter refine failed: {e}, falling back to Google API key...")
+
+    # --- Path 2 & 3: Gemini native SDK (Google API key or Vertex AI ADC) ---
     try:
         from google import genai
         from google.genai import types
-        
-        # Initialize client
-        project_id = get_config_val("google_cloud", "project_id", "GOOGLE_CLOUD_PROJECT", "")
+    except ImportError:
+        return None, "❌ Error: google-genai SDK not installed and OpenRouter unavailable."
+
+    google_api_key = get_config_val("api_keys", "google_api_key", "GOOGLE_API_KEY", "")
+    project_id = get_config_val("google_cloud", "project_id", "GOOGLE_CLOUD_PROJECT", "")
+
+    if google_api_key:
+        client = genai.Client(api_key=google_api_key)
+        via = "Google API key"
+    elif project_id:
         location = get_config_val("google_cloud", "location", "GOOGLE_CLOUD_LOCATION", "global")
-        
         client = genai.Client(vertexai=True, project=project_id, location=location)
-        
-        # Prepare content
+        via = "Vertex AI"
+    else:
+        return None, "❌ Error: No API credentials configured. Set OPENROUTER_API_KEY, GOOGLE_API_KEY, or configure Vertex AI project in configs/model_config.yaml."
+
+    try:
         contents = [
             types.Part.from_text(text=edit_prompt),
-            types.Part.from_bytes(
-                mime_type="image/jpeg",
-                data=image_bytes
-            )
+            types.Part.from_bytes(mime_type="image/jpeg", data=image_bytes),
         ]
-        
-        # Configure generation
-        config = types.GenerateContentConfig(
+        gen_config = types.GenerateContentConfig(
             temperature=1.0,
             max_output_tokens=8192,
             response_modalities=["IMAGE"],
@@ -206,31 +250,23 @@ async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9
                 image_size=image_size,
             ),
         )
-        
-        # Generate refined image
-        image_model = get_config_val("defaults", "image_gen_model_name", "IMAGE_GEN_MODEL_NAME", "")
         response = await asyncio.to_thread(
             client.models.generate_content,
             model=image_model,
             contents=contents,
-            config=config
+            config=gen_config,
         )
-        
-        # Extract image from response
         if response.candidates and response.candidates[0].content.parts:
             for part in response.candidates[0].content.parts:
-                if hasattr(part, 'inline_data') and part.inline_data:
+                if hasattr(part, "inline_data") and part.inline_data:
                     edited_image_data = part.inline_data.data
-                    
                     if isinstance(edited_image_data, bytes):
-                        return edited_image_data, "✅ Image refined successfully!"
+                        return edited_image_data, f"✅ Image refined successfully! (via {via})"
                     elif isinstance(edited_image_data, str):
-                        return base64.b64decode(edited_image_data), "✅ Image refined successfully!"
-        
-        return None, "❌ No image data found in response"
-    
+                        return base64.b64decode(edited_image_data), f"✅ Image refined successfully! (via {via})"
+        return None, f"❌ No image data found in {via} response"
     except Exception as e:
-        return None, f"❌ Error: {str(e)}"
+        return None, f"❌ {via} error: {str(e)}"
 
 
 def get_evolution_stages(result, exp_mode):
